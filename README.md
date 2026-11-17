@@ -74,6 +74,33 @@ uvicorn app.main:app --port 8000
 全量计分后排序的对照接口,响应结构相同,`scored` 恒为全库篇数 N。
 用于核对正式检索的前 k 一致性,不是正式检索路径。
 
+### `POST /review/sample` — 疑似重复记录复核抽样
+
+```json
+{"ids": ["R1106", "R1120"], "threshold": 0.8}
+```
+
+响应:
+
+```json
+{
+  "pairs": [{"id1": "R1106", "id2": "R1120", "similarity": 0.8333333333333334}],
+  "review_ids": ["R1106"]
+}
+```
+
+- 提交 2~18 个**现存**编号及 `threshold`(0.5~1,含端点)。
+- 每篇记录的分词序列先去重为词集合,再按 `|A ∩ B| / |A ∪ B|` 计算两两 Jaccard;
+  `similarity >= threshold` 的编号对计入 `pairs`,按 `(id1, id2)` 升序,`id1 < id2`。
+- **空词集合不形成相似对**:任一方分词去重后为空(含两方皆空)即跳过。
+- `review_ids`:覆盖所有相似对的最小复核编号集(每对至少一端入选);
+  最优解不止一组时,取升序编号序列字典序最小的一组,结果按编号升序返回。
+- 编号重复或缺失时整份请求返回 `422`(不返回部分结果)。
+- 一次抽样只从 `manager.current()` 取一版语料,相似对与复核集基于同一快照;
+  与批量更正并发时不会混用新旧语料,更正后再次抽样自动按新语料重算。
+- 复核集使用 2^m 子集 DP(候选编号即相似对端点,m ≤ 18)+ 字典序组合枚举,
+  最坏情况约 26 万个子集,单次请求开销可控。
+
 ### 其他
 
 - `GET /stats`:篇数、平均长度、词项数、BM25 参数。
@@ -90,7 +117,7 @@ uvicorn app.main:app --port 8000
 ## 验证
 
 ```bash
-python3 -m pytest tests/ -q     # 23 项单元/API/并发测试
+python3 -m pytest tests/ -q     # 44 项单元/API/并发测试
 python3 scripts/verify.py       # 穷举对照 + 随机回归 + 剪枝示例
 ```
 
@@ -107,6 +134,7 @@ python3 scripts/verify.py       # 穷举对照 + 随机回归 + 剪枝示例
 
 ```
 app/index.py      BM25 状态构建、BlockMax WAND、穷举对照、原子状态管理
+app/review.py     复核抽样:Jaccard 相似对、最小顶点覆盖、编号校验
 app/main.py       FastAPI 应用与端点
 app/schemas.py    请求/响应模型
 data/corpus.json  本地示例语料(scripts/gen_corpus.py 生成,确定性种子)

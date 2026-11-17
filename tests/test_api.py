@@ -127,3 +127,151 @@ def test_stats_and_healthz(client):
     s = client.get("/stats").json()
     assert s["docs"] == 2 and s["avg_len"] == 1.0 and s["terms"] == 2
     assert s["k1"] == 1.2 and s["b"] == 0.75
+
+
+# ---------------- 复核抽样 API ----------------
+
+
+def seed_review_docs(client):
+    upsert(client, [
+        {"id": "R1", "text": "a", "tokens": ["数控机床", "轴承过热", "更换轴承"]},
+        {"id": "R2", "text": "b", "tokens": ["数控机床", "轴承过热", "更换轴承"]},
+        {"id": "R3", "text": "c", "tokens": ["数控机床", "轴承过热", "清洗油路"]},
+        {"id": "R4", "text": "d", "tokens": ["空压机", "电机异响"]},
+        {"id": "R5", "text": "", "tokens": []},
+    ])
+
+
+def test_review_sample_basic(client):
+    seed_review_docs(client)
+    r = client.post(
+        "/review/sample",
+        json={"ids": ["R1", "R2", "R3", "R4", "R5"], "threshold": 0.5},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # R1/R2/R3 两两 Jaccard = 1.0 / 1.0 / 0.5;空词集合 R5 不形成相似对
+    assert [(p["id1"], p["id2"], p["similarity"]) for p in body["pairs"]] == [
+        ("R1", "R2", 1.0),
+        ("R1", "R3", 0.5),
+        ("R2", "R3", 0.5),
+    ]
+    assert body["review_ids"] == ["R1", "R2"]  # 最小覆盖 2 个,字典序最小
+    # 每对至少一端入选
+    chosen = set(body["review_ids"])
+    assert all(p["id1"] in chosen or p["id2"] in chosen for p in body["pairs"])
+
+
+def test_review_sample_threshold_edges(client):
+    seed_review_docs(client)
+    ids = ["R1", "R2", "R3", "R4"]
+    one = client.post("/review/sample", json={"ids": ids, "threshold": 1.0}).json()
+    assert [(p["id1"], p["id2"]) for p in one["pairs"]] == [("R1", "R2")]
+    assert one["review_ids"] == ["R1"]
+    half = client.post("/review/sample", json={"ids": ids, "threshold": 0.50001}).json()
+    assert len(half["pairs"]) == 1  # 0.5 刚好低于阈值
+    assert client.post("/review/sample", json={"ids": ids, "threshold": 0.4}).status_code == 422
+    assert client.post("/review/sample", json={"ids": ids, "threshold": 1.1}).status_code == 422
+
+
+def test_review_sample_id_count_bounds(client):
+    seed_review_docs(client)
+    assert client.post(
+        "/review/sample", json={"ids": ["R1"], "threshold": 0.5}
+    ).status_code == 422
+    ids = [f"X{i}" for i in range(19)]
+    assert client.post(
+        "/review/sample", json={"ids": ids, "threshold": 0.5}
+    ).status_code == 422
+    assert client.post(
+        "/review/sample", json={"ids": ["R1", "R2"], "threshold": 0.5}
+    ).status_code == 200
+
+
+def test_review_sample_rejects_duplicate_ids_whole_request(client):
+    seed_review_docs(client)
+    before = client.get("/stats").json()
+    r = client.post(
+        "/review/sample",
+        json={"ids": ["R1", "R2", "R1", "R3"], "threshold": 0.5},
+    )
+    assert r.status_code == 422
+    assert "重复" in r.json()["detail"]
+    assert client.get("/stats").json() == before  # 只读接口,状态不受影响
+
+
+def test_review_sample_rejects_missing_ids_whole_request(client):
+    seed_review_docs(client)
+    r = client.post(
+        "/review/sample",
+        json={"ids": ["R1", "R2", "NOPE", "ALSONOPE"], "threshold": 0.5},
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "NOPE" in detail and "ALSONOPE" in detail
+
+
+def test_review_sample_after_correction_uses_new_corpus(client):
+    seed_review_docs(client)
+    ids = ["R1", "R2", "R4"]
+    first = client.post("/review/sample", json={"ids": ids, "threshold": 0.5}).json()
+    assert [(p["id1"], p["id2"]) for p in first["pairs"]] == [("R1", "R2")]
+    # 更正 R2:R2 不再与 R1 相似,而与 R4 完全一致
+    upsert(client, [{"id": "R2", "text": "更正", "tokens": ["空压机", "电机异响"]}])
+    second = client.post("/review/sample", json={"ids": ids, "threshold": 0.5}).json()
+    assert [(p["id1"], p["id2"]) for p in second["pairs"]] == [("R2", "R4")]
+    assert second["review_ids"] == ["R2"]
+    # BM25 检索仍可用且反映更正
+    hits = client.post("/search", json={"terms": ["轴承过热"], "k": 5}).json()["hits"]
+    assert [h["id"] for h in hits] == ["R1", "R3"]
+
+
+def test_review_sample_isolated_from_concurrent_correction(client):
+    """并发更正期间抽样只能读到某一完整版本,不会混用两版语料。"""
+    upsert(client, [
+        {"id": "C1", "text": "v1", "tokens": ["a", "b", "c"]},
+        {"id": "C2", "text": "v1", "tokens": ["a", "b", "c"]},
+        {"id": "C3", "text": "v1", "tokens": ["a", "b", "c"]},
+    ])
+    ids = ["C1", "C2", "C3"]
+
+    seen = []
+    errors = []
+    first_sample_done = threading.Event()
+
+    def sampler():
+        try:
+            for _ in range(80):
+                body = client.post(
+                    "/review/sample", json={"ids": ids, "threshold": 0.5}
+                ).json()
+                seen.append(
+                    (len(body["pairs"]), {p["similarity"] for p in body["pairs"]})
+                )
+                first_sample_done.set()
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def corrector():
+        try:
+            assert first_sample_done.wait(timeout=5)
+            # 仅 C1 变成完全不同的词集合;C1~C2、C1~C3 相似度应同步消失
+            upsert(client, [{"id": "C1", "text": "v2", "tokens": ["x", "y", "z"]}])
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=sampler), threading.Thread(target=corrector)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert seen
+    # 合法版本只有两种:三对相似(旧语料,全 1.0),或仅 C2/C3 一对(新语料)。
+    # 任何"混用两版"的抽样都会同时出现这之外的相似对数量。
+    counts = {n for n, _ in seen}
+    assert counts <= {3, 1}
+    for _, sims in seen:
+        assert sims == {1.0}  # 每个合法版本内部相似度一致
+    assert any(n == 3 for n, _ in seen)
+    assert any(n == 1 for n, _ in seen)

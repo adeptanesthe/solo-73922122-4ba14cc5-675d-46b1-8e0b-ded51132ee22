@@ -3,6 +3,7 @@
 - POST /documents/batch  批量增改删(语料、全库统计、剪枝依据一起生效)
 - POST /search           正式检索(BlockMax WAND 块上界剪枝)
 - POST /search/exhaustive 对照接口(全量计分后排序,仅用于验证一致性)
+- POST /review/sample    疑似重复记录复核抽样(最小顶点覆盖)
 - GET  /stats            当前状态统计
 - GET  /healthz          健康检查
 - GET  /docs             Swagger UI
@@ -15,7 +16,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
 from .index import B, K1, MAX_DOCS, CapacityError, IndexManager, exhaustive_search, search
-from .schemas import BatchRequest, BatchResponse, Hit, SearchRequest, SearchResponse
+from .review import DuplicateIdsError, MissingIdsError, sample_review
+from .schemas import (
+    BatchRequest,
+    BatchResponse,
+    Hit,
+    ReviewSampleRequest,
+    ReviewSampleResponse,
+    SearchRequest,
+    SearchResponse,
+    SimilarPairOut,
+)
 
 
 def create_app(manager: IndexManager | None = None) -> FastAPI:
@@ -29,6 +40,7 @@ def create_app(manager: IndexManager | None = None) -> FastAPI:
         description=(
             "精确 BM25(k1=1.2, b=0.75, IDF=ln(1+(N-df+0.5)/(df+0.5)))。"
             "正式检索使用 BlockMax WAND 块上界剪枝,前 k 与穷举一致,同分按编号升序。"
+            "复核抽样按去重分词集合的 Jaccard 相似度找相似对,并给出最小复核编号集。"
         ),
     )
     app.state.manager = manager
@@ -81,6 +93,28 @@ def create_app(manager: IndexManager | None = None) -> FastAPI:
         hits, scored = exhaustive_search(state, req.terms, req.k)
         return SearchResponse(
             hits=[Hit(id=i, text=t, score=sc) for i, t, sc in hits], scored=scored
+        )
+
+    @app.post("/review/sample", response_model=ReviewSampleResponse, tags=["review"])
+    def review_sample_ep(req: ReviewSampleRequest):
+        """复核抽样:相似对 + 覆盖每对的最小复核编号集。
+
+        ``manager.current()`` 只取一次,本次抽样的相似对与复核集都基于这一版语料;
+        与记录更正并发时,要么全用旧版、要么全用新版,不会混用。
+        """
+        state = manager.current()  # 一次抽样只使用同一版语料
+        try:
+            pairs, review_ids = sample_review(state.docs, req.ids, req.threshold)
+        except DuplicateIdsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except MissingIdsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return ReviewSampleResponse(
+            pairs=[
+                SimilarPairOut(id1=p.id1, id2=p.id2, similarity=p.similarity)
+                for p in pairs
+            ],
+            review_ids=review_ids,
         )
 
     return app

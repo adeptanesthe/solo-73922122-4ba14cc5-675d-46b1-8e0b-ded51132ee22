@@ -14,7 +14,8 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from types import MappingProxyType
+from typing import Iterable, Mapping
 
 import numpy as np
 
@@ -46,7 +47,7 @@ class State:
     构建完成后任何字段都不再修改;查询全程持有同一引用即保证一致性。
     """
 
-    docs: dict  # 编号 -> (正文, 分词序列 tuple);按约定不再修改
+    docs: Mapping  # 编号 -> (正文, 分词序列 tuple);只读视图,构建后不再修改
     ids: tuple  # 内部文档号 -> 编号(编号升序)
     texts: tuple  # 内部文档号 -> 正文
     n: int  # 总篇数 N(空文档计入)
@@ -95,7 +96,14 @@ def build_state(docs: dict) -> State:
             docids=docids, contribs=contribs, block_last=block_last, suffix_max=suffix_max
         )
 
-    return State(docs=docs, ids=ids, texts=texts, n=n, avgdl=avgdl, terms=terms)
+    return State(
+        docs=MappingProxyType(docs),  # 只读视图:构建后任何读者都改不动这一版语料
+        ids=ids,
+        texts=texts,
+        n=n,
+        avgdl=avgdl,
+        terms=terms,
+    )
 
 
 class _Cursor:
